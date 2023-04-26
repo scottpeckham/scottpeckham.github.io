@@ -1,0 +1,191 @@
+---
+title: "Clusters and Home Ranges"
+output: html_document
+date: "2023-04-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mapview)
+library(dplyr)
+library(sf)
+library(sp)
+library(RColorBrewer)
+library(RSQLite)
+library(knitr)
+```
+
+```{r functions, echo=FALSE}
+# local functions to help #
+getBioYear <- function(indate){
+  year <- as.numeric(strftime(indate, format="%Y",tz="UTC"))
+  month <- as.numeric(strftime(indate, format = "%m",tz="UTC"))
+  if(month > 4) bioyear <- year else bioyear <- year-1
+  return(bioyear)
+}
+addBioYear <- function(gps.data){
+  # create a capture year column #
+  gps.data$BioYear <-unlist(lapply(gps.data$acquisitiontime, getBioYear))
+  return(gps.data)
+}
+
+removeMissingGPS <- function(gps){
+  # check for missing lat/lon and drop #
+  missing.loc <- which(is.na(gps$latitude),arr.ind=TRUE)
+  gps <- gps[-(missing.loc),]
+  return(gps)
+}
+```
+
+
+
+## Simple Clustering
+
+First step is to evaluate any social organization of collared animals by looking at their GPS locations. Some herds have more obvious population substructure.
+
+To do this, we'll read data from the data base, subset to our specified parameters (bio year, date range) and then compute the mean location for each animal over the time period of interest. 
+
+```{r inputs, echo=FALSE}
+###### user supplied inputs ###################################################
+# path to db
+  dbpath <- "/Users/scottp/DocumentsNew/BighornSheep/FY22-WSF-GIA/Databases/BHS_TriState.db"
+
+# gps table name in DB
+  gps.tab.name <- "AnimalID_GPS_Data_AllCollars_2023_04_06"
+
+# minimum number of GPS fixes needed to compute a home range (has to be >5)
+min.fixes <- 60 # one month of 13-hr data = 60
+
+# we need to define projected coord systems for each herd or area #
+  or.prj <- CRS("+init=epsg:26911")  # UTM11N NAD83
+  #or.prj <- CRS("+init=epsg:2992")  # oregon lambert
+  wa.prj <- CRS("+init=epsg:2285")  # WA state plane north is 2285, south is 2927
+  wgs.proj <- CRS("+init=epsg:4326") # CRS used for GPS data files
+
+# do we want to subset the data to a biological year or date range?
+  bioyear.sub <- TRUE
+  bioyear <- 2022
+
+# do we want to subset on a range of dates
+  daterange.sub <- FALSE
+  daterange.sub.dates <- as.POSIXct(c("2022-01-01 00:01","2022-04-01 00:01"),tz="UTC")
+  drtext <- as.character(strptime(daterange.sub.dates, format="%Y-%m-%d",tz=''))
+
+# Subset to a herd? #
+  herd.sub <- TRUE
+  herd <- "Lookout Mountain"
+
+# Print to user what we are doing #
+  paste("Evaluating clusters for",herd)
+  paste("Subset by Biological Year:",bioyear.sub)
+    if(bioyear.sub) paste("Biological Year:",bioyear)
+  paste("Subset by date range:",daterange.sub)
+   if(daterange.sub) paste("Start Date:",daterange.sub.dates[1], "  End Date:",daterange.sub.dates[2] )
+  paste("From table:", gps.tab.name)
+  
+```
+
+
+```{r body}
+# Connect to the data base read GPS table we need #
+  con <- dbConnect(RSQLite::SQLite(),dbpath, extended_types=TRUE)
+  
+    # Read table of AnimalID attributed GPS data 
+    gps.full <- dbReadTable(con,gps.tab.name) 
+  
+# close out DB connection
+  dbDisconnect(con)
+
+```
+
+```{r prep, echo=FALSE}
+# copy the full data set
+  gps <- gps.full
+  
+# make necessary subsets #
+  if (bioyear.sub) {
+    # add a bioyear column if needed #
+    gps <- addBioYear(gps.full)
+    gps <- gps %>% filter(BioYear==bioyear) 
+  }
+  if (herd.sub) {
+    gps <- gps %>% filter(Herd==herd) 
+  }
+  
+  if (daterange.sub) gps <- gps %>% filter(acquisitiontime >= daterange.sub.dates[1] &
+                                                  acquisitiontime <= daterange.sub.dates[2])
+# check for missing lat/lon and drop #
+  gps <- removeMissingGPS(gps)
+
+```
+
+```{r project}
+# assign spatial ref, subset
+  gps.sf <- st_as_sf(gps, coords = c("longitude", "latitude"), crs = 4326)
+
+# transorm projection, convert to spatial pts df
+    # determine appropriate projected coord system for function input#
+  projection <- switch(herd,
+            "Burnt River"=or.prj, "Lookout Mountain" =or.prj,
+            "Yakima Canyon" = wa.prj, "Cleman Mountain" = wa.prj)
+  
+  gps.pr <- gps.sf %>% subset(select=AnimalID) %>% st_transform(projection)
+  gps.sp <- as(gps.pr,"Spatial")
+
+```
+
+## Viewing our GPS locations
+
+```{r mappoints, echo=FALSE}
+nanimal <- length(unique(gps.sf$AnimalID))
+mycolors1 <- colorRampPalette(brewer.pal(8, "Dark2"))(nanimal)
+mapview(gps.sf, zcol="AnimalID", legend=TRUE, cex=4,lwd=1, col.regions=mycolors1,alpha.regions=0.9)
+```
+
+```{r dataprep, echo=FALSE}
+# construct the matrix for the function dist()
+  df <- cbind(gps.sp@data,gps.sp@coords)
+  df.m <- df %>% group_by(AnimalID) %>% summarise(meanX=mean(coords.x1),
+                                                 meanY=mean(coords.x2))
+  df.m <- df.m %>% data.frame()
+  xy <- df.m[,2:3]
+  rownames(xy) <- df.m$AnimalID
+  
+```
+
+## Computing Clusters
+
+Next we'll then compute a distance matrix based off mean locations and apply a hierarchical clustering method using 'hclust' and the function 'cutree' to determine the number of clusters based off the height input to 'cutree'. The 'height' parameter cuts the cluster dendrogram at a specific value rather than specifying a set number of clusters through the 'k' parameter. In this analysis, we could modify our valud of 'd' below based on prior knowledge or what distance we want to consider a minimum for cluster membership.
+```{r cluster}
+# perform clustering
+  p.dist <- dist(xy)
+  chc <- hclust(p.dist, method="ward.D2")
+  
+  xy.sp <- SpatialPointsDataFrame(matrix(c(xy$meanX,xy$meanY), ncol=2), 
+                                  data.frame(AnimalID=rownames(xy)), proj4string=projection)
+
+# Distance with a 5000m threshold, larger value will yield fewer clusters
+#   5-6k chosen here, it's ~ axis of typical Lookout Mountain home range
+  d <- 5000
+  chc.d5k <- cutree(chc, h=d) 
+  
+# Join results to display sp points
+  xy.sp@data <- data.frame(xy.sp@data, Clust=chc.d5k)
+ 
+# Cluster membership, ordered
+  rownames(xy.sp@data) <- NULL
+  xy.sp@data %>% arrange(Clust)
+```
+
+## Viewing the Clusters on a Map
+
+Evaluate our results visually:
+
+```{r map, echo=FALSE}
+  nclust <- max(xy.sp@data$Clust)
+  mycolors <- colorRampPalette(brewer.pal(8, "RdYlGn"))(nclust)
+  mapview(xy.sp,zcol="Clust",col.regions=mycolors, alpha.regions=1,label="AnimalID") 
+
+```
+
+
