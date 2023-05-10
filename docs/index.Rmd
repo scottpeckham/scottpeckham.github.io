@@ -1,67 +1,44 @@
 ---
-title: "Clusters and Home Ranges"
-output: html_document
-date: "2023-04-07"
+title: "Lower Salmon Clusters, Communities, and Home Ranges"
+date: 
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: scroll
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(mapview)
 library(dplyr)
+library(dbplyr)
 library(sf)
 library(sp)
 library(RColorBrewer)
 library(RSQLite)
 library(knitr)
+library(flexdashboard)
+library(stringr)
+library(dendextend)
 ```
-
-```{r functions, echo=FALSE}
-# local functions to help #
-getBioYear <- function(indate){
-  year <- as.numeric(strftime(indate, format="%Y",tz="UTC"))
-  month <- as.numeric(strftime(indate, format = "%m",tz="UTC"))
-  if(month > 4) bioyear <- year else bioyear <- year-1
-  return(bioyear)
-}
-addBioYear <- function(gps.data){
-  # create a capture year column #
-  gps.data$BioYear <-unlist(lapply(gps.data$acquisitiontime, getBioYear))
-  return(gps.data)
-}
-
-removeMissingGPS <- function(gps){
-  # check for missing lat/lon and drop #
-  missing.loc <- which(is.na(gps$latitude),arr.ind=TRUE)
-  gps <- gps[-(missing.loc),]
-  return(gps)
-}
-```
-
-
-
-## Simple Clustering
-
-First step is to evaluate any social organization of collared animals by looking at their GPS locations. Some herds have more obvious population substructure.
-
-To do this, we'll read data from the data base, subset to our specified parameters (bio year, date range) and then compute the mean location for each animal over the time period of interest. 
 
 ```{r inputs, echo=FALSE}
 ###### user supplied inputs ###################################################
 # path to db
-  dbpath <- "/Users/scottp/DocumentsNew/BighornSheep/FY22-WSF-GIA/Databases/BHS_TriState.db"
+  #dbpath <- "/Users/scottp/DocumentsNew/BighornSheep/FY22-WSF-GIA/Databases/BHS_TriState.db"
+  dbpath <- "/Users/scottp/Library/CloudStorage/Box-Box/WSF-GIA-FY22/Database/BHS_TriState.db"
 
-# gps table name in DB
-  gps.tab.name <- "AnimalID_GPS_Data_AllCollars_2023_04_06"
+# gps, serology, bacteriology table names in DB
+  gps.tab.name <- "AnimalID_GPS_Data_AllCollars_2023_05_10"
+  pcr.tab.name <- "TriState_Bacteriology"
+  ser.tab.name <- "TriState_PCR_Status"
 
-# minimum number of GPS fixes needed to compute a home range (has to be >5)
-min.fixes <- 60 # one month of 13-hr data = 60
-
-# we need to define projected coord systems for each herd or area #
-  or.prj <- CRS("+init=epsg:26911")  # UTM11N NAD83
-  #or.prj <- CRS("+init=epsg:2992")  # oregon lambert
-  wa.prj <- CRS("+init=epsg:2285")  # WA state plane north is 2285, south is 2927
-  wgs.proj <- CRS("+init=epsg:4326") # CRS used for GPS data files
-
+# Forcing analysis to one herd #
+  herd <- "Lower Salmon"  # choose from "Lookout Mountain", "Burnt River", "Yakima Canyon", "Cleman Mountain",
+                           #   "Lower Salmon", "Lower Panther Main Salmon"
+  
 # do we want to subset the data to a biological year or date range?
   bioyear.sub <- TRUE
   bioyear <- 2022
@@ -70,11 +47,59 @@ min.fixes <- 60 # one month of 13-hr data = 60
   daterange.sub <- FALSE
   daterange.sub.dates <- as.POSIXct(c("2022-01-01 00:01","2022-04-01 00:01"),tz="UTC")
   drtext <- as.character(strptime(daterange.sub.dates, format="%Y-%m-%d",tz=''))
+  
+# Home range settings
+  HRestimator <- "BB"   # must be either "Normal" for bivariate normal or "BB" for brownian bridge
+                        #   note that BB will add significant computational time
+  contour.percent <- 75   # the input to getverticesHR function to cut the UD
+  min.fixes <- 60 # one month of 13-hr data = 60, must be >5
+  
+# Define projected coord systems for each herd or area #
+  # we need a mix as some older packages use the CRS() function which sf does not
+  or.prj <- 26911 # UTM11N NAD83
+  or.crsprj <- CRS("+init=epsg:26911")  
+  wa.crsprj <- CRS("+init=epsg:2285")  # WA state plane north is 2285, south is 2927
+  wa.prj <- 2285
+  wgs.crsproj <- CRS("+init=epsg:4326") # CRS used for GPS data files
+  wgs.proj <- 4326
+  id.prj <- 8826 # Idaho Transverse Mercator
+  id.crsprj <- CRS("+init=epsg:8826") 
+  
+```
 
-# Subset to a herd? #
-  herd.sub <- TRUE
-  herd <- "Lookout Mountain"
+```{r functions, echo=FALSE}
+# Helper file full of longer functions
+source("HomeRange-helpers.R")
 
+# local functions to help #
+removeMissingGPS <- function(gps){
+  # check for missing lat/lon and drop #
+  missing.loc <- which(is.na(gps$Latitude),arr.ind=TRUE)
+  if (length(missing.loc) > 0) gps <- gps[-(missing.loc),]
+  return(gps)
+}
+```
+
+# Intro {.sidebar}
+
+This dashboard shows some of the workflow and R code behind it, 
+although most of the code is hidden in the backdrop. The complete
+Markdown .Rmd is available on Github.
+
+Each tab has more in-depth coverage of:
+
+* Clustering by animal GPS locations
+* Computing individual home ranges and overlap
+* Deriving network clusters from overlap of home ranges
+* Linking *Movi* testing data back to the network
+
+Email any questions to:
+scott.peckham78@gmail.com
+
+
+# Simple Clustering
+### Evaluation Parameters
+```{r printparam, echo=FALSE}
 # Print to user what we are doing #
   paste("Evaluating clusters for",herd)
   paste("Subset by Biological Year:",bioyear.sub)
@@ -82,34 +107,42 @@ min.fixes <- 60 # one month of 13-hr data = 60
   paste("Subset by date range:",daterange.sub)
    if(daterange.sub) paste("Start Date:",daterange.sub.dates[1], "  End Date:",daterange.sub.dates[2] )
   paste("From table:", gps.tab.name)
-  
 ```
 
+### GPS Clusters
+First step is to evaluate any social organization of collared animals by looking at their GPS locations. Some herds have more obvious population substructure than others. This is a pretty basic analysis but might be helpful for some high-level grouping. However, it may not work really well for animals that show multi-modal type distribution patterns in their location data (i.e. multiple distinct activity centers). 
 
-```{r body}
+To do this, we'll read data from the data base, subset to our specified parameters (bio year, date range) and then compute the median location for each animal over the time period of interest. 
+
+
+```{r body, echo=FALSE}
 # Connect to the data base read GPS table we need #
   con <- dbConnect(RSQLite::SQLite(),dbpath, extended_types=TRUE)
-  
-    # Read table of AnimalID attributed GPS data 
-    gps.full <- dbReadTable(con,gps.tab.name) 
-  
+
+    # Direct Read table of testing data
+    pcr <- dbReadTable(con,pcr.tab.name)
+    ser <- dbReadTable(con,ser.tab.name)
+    
+    # query for gps, don't read into memory
+      gps_db <- tbl(con, gps.tab.name) # reference to the table
+      # store in data frame
+      gps <- gps_db %>% filter(Herd==herd) %>% collect()
+    
+      
 # close out DB connection
   dbDisconnect(con)
+
+  
 
 ```
 
 ```{r prep, echo=FALSE}
-# copy the full data set
-  gps <- gps.full
-  
+
 # make necessary subsets #
   if (bioyear.sub) {
     # add a bioyear column if needed #
-    gps <- addBioYear(gps.full)
+    gps <- addBioYear(gps)
     gps <- gps %>% filter(BioYear==bioyear) 
-  }
-  if (herd.sub) {
-    gps <- gps %>% filter(Herd==herd) 
   }
   
   if (daterange.sub) gps <- gps %>% filter(acquisitiontime >= daterange.sub.dates[1] &
@@ -119,73 +152,206 @@ min.fixes <- 60 # one month of 13-hr data = 60
 
 ```
 
-```{r project}
+```{r project, echo=FALSE}
 # assign spatial ref, subset
-  gps.sf <- st_as_sf(gps, coords = c("longitude", "latitude"), crs = 4326)
+  gps.sf <- st_as_sf(gps, coords = c("Longitude", "Latitude"), crs = 4326)
 
 # transorm projection, convert to spatial pts df
     # determine appropriate projected coord system for function input#
   projection <- switch(herd,
             "Burnt River"=or.prj, "Lookout Mountain" =or.prj,
-            "Yakima Canyon" = wa.prj, "Cleman Mountain" = wa.prj)
+            "Yakima Canyon" = wa.prj, "Cleman Mountain" = wa.prj,
+            "Lower Salmon" = id.prj, "Lower Panther Main Salmon" = id.prj)
+  crs.projection <- switch(herd,
+            "Burnt River"=or.crsprj, "Lookout Mountain" =or.crsprj,
+            "Yakima Canyon" = wa.crsprj, "Cleman Mountain" = wa.crsprj,
+            "Lower Salmon" = id.crsprj, "Lower Panther Main Salmon" = id.crsprj)
   
   gps.pr <- gps.sf %>% subset(select=AnimalID) %>% st_transform(projection)
   gps.sp <- as(gps.pr,"Spatial")
 
 ```
 
-## Viewing our GPS locations
+### Viewing our GPS locations
 
 ```{r mappoints, echo=FALSE}
 nanimal <- length(unique(gps.sf$AnimalID))
-mycolors1 <- colorRampPalette(brewer.pal(8, "Dark2"))(nanimal)
-mapview(gps.sf, zcol="AnimalID", legend=TRUE, cex=4,lwd=1, col.regions=mycolors1,alpha.regions=0.9)
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+    col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+    mycolors1 <- sample(col_vector, nanimal)
+    
+mapview(gps.sf, zcol="AnimalID", legend=TRUE, cex=2.5,lwd=1, col.regions=mycolors1,alpha.regions=0.9)
 ```
 
 ```{r dataprep, echo=FALSE}
 # construct the matrix for the function dist()
   df <- cbind(gps.sp@data,gps.sp@coords)
-  df.m <- df %>% group_by(AnimalID) %>% summarise(meanX=mean(coords.x1),
-                                                 meanY=mean(coords.x2))
+  df.m <- df %>% group_by(AnimalID) %>% summarise(medX=median(coords.x1),
+                                                 medY=median(coords.x2),
+                                                 sdX=sd(coords.x1),
+                                                 sdY=sd(coords.x2))
   df.m <- df.m %>% data.frame()
   xy <- df.m[,2:3]
   rownames(xy) <- df.m$AnimalID
   
 ```
 
-## Computing Clusters
+### Computing Clusters
 
-Next we'll then compute a distance matrix based off mean locations and apply a hierarchical clustering method using 'hclust' and the function 'cutree' to determine the number of clusters based off the height input to 'cutree'. The 'height' parameter cuts the cluster dendrogram at a specific value rather than specifying a set number of clusters through the 'k' parameter. In this analysis, we could modify our valud of 'd' below based on prior knowledge or what distance we want to consider a minimum for cluster membership.
+Next we'll then compute a distance matrix based off median locations and apply a hierarchical clustering method using 'hclust' and the function 'cutree' to determine the number of clusters based off the height input to 'cutree'. The 'height' parameter cuts the cluster dendrogram at a specific value rather than specifying a set number of clusters through the 'k' parameter. In this analysis, we could modify our value of 'd' below based on prior knowledge or what distance we want to consider a minimum for cluster membership. Here 'd' is set to 3x the median standard deviation in the location data when grouped by individual animal. Conversely we could use several tests to optimize the choice of k for each set of data and clustering agglomeration method. In exploratory analyses, the UPGMA or "average" method provided the best fit.
+
 ```{r cluster}
 # perform clustering
   p.dist <- dist(xy)
-  chc <- hclust(p.dist, method="ward.D2")
+  chc <- hclust(p.dist, method="average")
   
-  xy.sp <- SpatialPointsDataFrame(matrix(c(xy$meanX,xy$meanY), ncol=2), 
-                                  data.frame(AnimalID=rownames(xy)), proj4string=projection)
-
-# Distance with a 5000m threshold, larger value will yield fewer clusters
-#   5-6k chosen here, it's ~ axis of typical Lookout Mountain home range
-  d <- 5000
-  chc.d5k <- cutree(chc, h=d) 
+  xy.sp <- SpatialPointsDataFrame(matrix(c(xy$medX,xy$medY), ncol=2), 
+                                  data.frame(AnimalID=rownames(xy)), proj4string=crs.projection)
+  
+  
+# Distance threshold, larger value will yield fewer clusters
+#   6-7k chosen here, it's ~ axis of typical Lookout Mountain home range
+  #d <- 6000
+  d <- 3 * median(sqrt(df.m$sdX^2+df.m$sdY^2))
+  chc.d <- cutree(chc, h=d)
+  nclust <- max(chc.d) 
   
 # Join results to display sp points
-  xy.sp@data <- data.frame(xy.sp@data, Clust=chc.d5k)
+  xy.sp@data <- data.frame(xy.sp@data, Clust=chc.d)
  
 # Cluster membership, ordered
   rownames(xy.sp@data) <- NULL
-  xy.sp@data %>% arrange(Clust)
+  clusters <- sort(unique(xy.sp@data$Clust))
+  members <- c(rep("",length(clusters)))
+  for (i in 1:length(clusters)){
+    membs <- xy.sp@data$AnimalID[xy.sp@data$Clust==clusters[i]]
+    members[i] <- str_flatten(membs,collaps=", ")
+  }
+  kable(data.frame(Cluster=clusters,Members=members),align='ll')
 ```
 
-## Viewing the Clusters on a Map
+### Plotting Raw Cluster Dendrograms
+```{r clusterp1, echo=FALSE,fig.height = 6, fig.width = 8, fig.align = "center"}
+#plot(chc, main="Cluster Dendrogram",cex=0.6)
+
+dend <- as.dendrogram(chc)
+dend <- set(dend, "labels_cex", 0.6)
+plot(dend, main="Cluster Dendrogram")
+```
+
+### Plotting Cut Cluster Dendrograms
+```{r clusterp2, echo=FALSE,fig.height = 6, fig.width = 8, fig.align = "center"}
+nclust <- as.integer(max(xy.sp@data$Clust))
+mycolors1 <- sample(col_vector, nclust)
+# plot(chc,cex=0.6,main=paste("Cluster Dendrogram cut at ",d," (m)",sep=''))
+# rect.hclust(chc,h=d,border=rev(mycolors1))
+
+# color labels by cluster:
+
+col_clus <- mycolors1[chc.d]
+labels_colors(dend) <- col_clus[order.dendrogram(dend)]
+
+plot(dend, main=paste("Cluster Dendrogram cut at ",round(d)," (m)",sep=''))
+```
+
+### Viewing the Clusters on a Map
 
 Evaluate our results visually:
 
-```{r map, echo=FALSE}
-  nclust <- max(xy.sp@data$Clust)
-  mycolors <- colorRampPalette(brewer.pal(8, "RdYlGn"))(nclust)
-  mapview(xy.sp,zcol="Clust",col.regions=mycolors, alpha.regions=1,label="AnimalID") 
+```{r map, echo=FALSE,fig.height = 6, fig.width = 8, fig.align = "center"}
+  
+  
+  mapview(xy.sp,zcol="Clust",col.regions=mycolors1, alpha.regions=1,label="AnimalID") 
+
+```
+
+# Home Range Overlap
+### Computing home ranges
+
+Here we will compute home ranges for every GPS-collared animal in the herd using the 'adehabitatHR' package and either a bivariate normal or brownian bridge kernel function. Then, the amount of overlap between each animal (area or UD) is calculated and stored in a matrix. We've set the kernel function, minimum fixes, and contour level used to compute the home range from the utilization distribution in the user-input section in the head of this Markdown .Rmd
+
+```{r homeranges}
+if (HRestimator=="BB"){
+homeranges <- calculateBBHomerange(gps.sf,min.fixes=min.fixes,contour.percent=contour.percent, output.proj=projection)
+} else homeranges <- calculateHomerange(gps.sf,min.fixes=min.fixes,contour.percent=contour.percent, output.proj=projection)
+```
+
+### Map of home ranges
+
+
+```{r maphr, echo=FALSE,fig.height = 7, fig.width = 9, fig.align = "center"}
+    qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+    col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+    mycolors2 <- sample(col_vector, length(homeranges$id))
+    
+    homeranges.sf <- st_as_sf(homeranges)   # for some reason the BB homeranges CRS are screwed up by adehabitat
+    st_crs(homeranges.sf) <- projection
+    
+    makeHomerangeMap(homeranges.sf,mycolors2)
+    # mapview(gps.sf, zcol="AnimalID", legend=TRUE, cex=2,lwd=1, col.regions=mycolors2,alpha.regions=0.9)+
+    #   mapview(homeranges.sf, zcol="id", burst=TRUE,legend=TRUE, cex=4,lwd=1, col.regions=mycolors2,alpha=0.6)
+    #   
+    
+    
+
+```
+
+### Evaluating amount of overlap between animals
+A plot showing the amount of overlap between each pair of animals. This gets pretty messy with large numbers of individuals, so it probably makes more sense to explore the relationships between animals using this measure in a clustering algorithm.
+
+### Home range overlap
+```{r ovplot, echo=FALSE,fig.height = 10, fig.width = 10, fig.align = "center"}
+
+  overlap <- calculateHomerangeOverlap(homeranges)
+  overlapImagePlot(overlap)
 
 ```
 
 
+# Clustering from Overlap
+### Using overlap as a measure of connectivity between animals
+In the last tab, we computed a matrix that contained the fraction of each animals home range (by row in the matrix) contained in every other animal in the herd (by columns). Now, treating this as a weighted adjacency matrix we can use tools from the 'igraph' network analysis package to map clusters viewing this data as a directed social network, with the connection between animals weighted by the amount of home range overlap. Note that in a directed network,the connection A to B can be different than B to A, which matches our data. Here we are showing the adjacency matrix clustered using a hierarchical walktrap method and displayed in two plots: 1) plot of the network and 2) a dendrogram. Note that the group colors in the network plot match the leaf text color in the dendrogram.
+
+### Network plot
+```{r networkplot, echo=FALSE, fig.height = 8, fig.width = 10.5, fig.align = "center"}
+overlapNetworkPlot(overlap)
+```
+
+### Dendrogram 
+```{r clusterPlot,echo=FALSE, fig.height = 8, fig.width = 10.5, fig.align = "center"}
+
+overlapClusterDend(overlap)
+
+```
+
+### Display cluster membership
+
+```{r members, echo=FALSE, fig.height = 4, fig.width = 6, fig.align = "center"}
+df <- getClusterData(overlap)
+clusters <- sort(unique(df$Cluster))
+  members <- c(rep("",length(clusters)))
+  for (i in 1:length(clusters)){
+    membs <- df$AnimalID[df$Cluster==clusters[i]]
+    members[i] <- str_flatten(membs,collapse=", ")
+  }
+  kable(data.frame(Cluster=clusters,Members=members),align='ll')
+```
+
+
+# Linking Testing Data to Networks
+### Combining testing results with the social network
+Now that we have mapped out existing social groups based on overlap in individual home ranges, we can add the results of testing for Movi to our display. By linking each animal back to the testing results records in our database. Note these plots are interactive.
+
+### Network plot with ELISA Status
+```{r attplot1, echo=FALSE, fig.height = 8, fig.width = 8, fig.align = "center" }
+
+attributeNetworkPlot(overlap, display="Elisa", gps)
+  
+```
+
+### Network plot with PCR Status
+```{r attplot2, echo=FALSE, fig.height = 8, fig.width = 8, fig.align = "center" }
+
+attributeNetworkPlot(overlap, display="PCR", gps)
+  
+```
